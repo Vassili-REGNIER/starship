@@ -190,6 +190,9 @@
         "format": "[$gauge $percentage]($style) ",
         "symbol": "",
         "gauge_width": 5,
+        "gauge_full_symbol": "█",
+        "gauge_partial_symbol": "▒",
+        "gauge_empty_symbol": "░",
         "display": [
           {
             "threshold": 0.0,
@@ -1903,6 +1906,16 @@
         "detect_folders": []
       }
     },
+    "yadm": {
+      "$ref": "#/$defs/YadmConfig",
+      "default": {
+        "format": "[$symbol]($style)",
+        "symbol": " ",
+        "style": "red",
+        "repo_path": null,
+        "disabled": false
+      }
+    },
     "zig": {
       "$ref": "#/$defs/ZigConfig",
       "default": {
@@ -2318,6 +2331,18 @@
           "minimum": 0,
           "maximum": 255,
           "default": 5
+        },
+        "gauge_full_symbol": {
+          "type": "string",
+          "default": "█"
+        },
+        "gauge_partial_symbol": {
+          "type": "string",
+          "default": "▒"
+        },
+        "gauge_empty_symbol": {
+          "type": "string",
+          "default": "░"
         },
         "display": {
           "type": "array",
@@ -7062,6 +7087,35 @@
             "type": "string"
           },
           "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "YadmConfig": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "type": "string",
+          "default": "[$symbol]($style)"
+        },
+        "symbol": {
+          "type": "string",
+          "default": " "
+        },
+        "style": {
+          "type": "string",
+          "default": "red"
+        },
+        "repo_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "disabled": {
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false
