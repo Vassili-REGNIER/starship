@@ -5081,18 +5081,18 @@ For the default paths (3–4), Starship only treats the directory as a candidate
 
 ### Options
 
-| Option       | Default               | Description                                                                 |
-| ------------ | --------------------- | --------------------------------------------------------------------------- |
-| `format`     | `'[$symbol]($style)'` | The format for the module.                                                  |
-| `symbol`     | `' '`                | The symbol shown when the module is displayed.                              |
-| `style`      | `'red'`               | The style for the module.                                                   |
-| `repo_path`  | `''`                  | Path to the YADM bare repository; when empty, env and default paths apply. |
-| `disabled`   | `false`               | Disables the `yadm` module.                                                 |
+| Option      | Default               | Description                                                                |
+| ----------- | --------------------- | -------------------------------------------------------------------------- |
+| `format`    | `'[$symbol]($style)'` | The format for the module.                                                 |
+| `symbol`    | `' '`                | The symbol shown when the module is displayed.                             |
+| `style`     | `'red'`               | The style for the module.                                                  |
+| `repo_path` | `''`                  | Path to the YADM bare repository; when empty, env and default paths apply. |
+| `disabled`  | `false`               | Disables the `yadm` module.                                                |
 
 ### Variables
 
-| Variable | Example | Description                         |
-| -------- | ------- | ----------------------------------- |
+| Variable | Example | Description                          |
+| -------- | ------- | ------------------------------------ |
 | `symbol` |         | Mirrors the value of option `symbol` |
 | `style`* |         | Mirrors the value of option `style`  |
 
