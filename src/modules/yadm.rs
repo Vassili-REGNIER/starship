@@ -335,7 +335,61 @@ mod tests {
     use crate::utils::create_command;
     use std::fs;
     use std::io;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    /// Same identity and fsync defaults as `crate::test::fixture_repo` / `git_metrics` tests.
+    fn configure_git_user_and_fsync(repo: &Path) -> io::Result<()> {
+        let email = create_command("git")?
+            .args(["config", "--local", "user.email", "starship@example.com"])
+            .current_dir(repo)
+            .output()?;
+        if !email.status.success() {
+            return Err(io::Error::other(format!(
+                "git config user.email failed: {}",
+                String::from_utf8_lossy(&email.stderr)
+            )));
+        }
+        let name = create_command("git")?
+            .args(["config", "--local", "user.name", "starship"])
+            .current_dir(repo)
+            .output()?;
+        if !name.status.success() {
+            return Err(io::Error::other(format!(
+                "git config user.name failed: {}",
+                String::from_utf8_lossy(&name.stderr)
+            )));
+        }
+        let _ = create_command("git")?
+            .args(["config", "--local", "core.fsync", "all"])
+            .current_dir(repo)
+            .output();
+        let _ = create_command("git")?
+            .args(["config", "--local", "core.fsyncObjectFiles", "true"])
+            .current_dir(repo)
+            .output();
+        Ok(())
+    }
+
+    /// Matches `git_metrics::create_repo_with_commit`: `init --quiet`, Starship test user, then
+    /// `checkout -b master` (may fail if already on `master`).
+    fn init_git_repo_starship_style(repo: &Path) -> io::Result<()> {
+        let init = create_command("git")?
+            .args(["init", "--quiet"])
+            .current_dir(repo)
+            .output()?;
+        if !init.status.success() {
+            return Err(io::Error::other(format!(
+                "git init failed: {}",
+                String::from_utf8_lossy(&init.stderr)
+            )));
+        }
+        configure_git_user_and_fsync(repo)?;
+        let _ = create_command("git")?
+            .args(["checkout", "-b", "master"])
+            .current_dir(repo)
+            .output();
+        Ok(())
+    }
 
     fn context_with_env(env: Env<'static>) -> Context<'static> {
         Context::new_with_shell_and_path(
@@ -353,7 +407,7 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let marker = tmp.path().join("bare.git");
         fs::create_dir_all(marker.join("objects"))?;
-        fs::write(marker.join("HEAD"), "ref: refs/heads/main\n")?;
+        fs::write(marker.join("HEAD"), "ref: refs/heads/master\n")?;
         fs::write(
             marker.join("config"),
             "[core]\n\tbare = true\nrepositoryformatversion = 0\n",
@@ -384,7 +438,7 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let marker = tmp.path().join("from-env.git");
         fs::create_dir_all(marker.join("objects"))?;
-        fs::write(marker.join("HEAD"), "ref: refs/heads/main\n")?;
+        fs::write(marker.join("HEAD"), "ref: refs/heads/master\n")?;
         fs::write(
             marker.join("config"),
             "[core]\n\tbare = true\nrepositoryformatversion = 0\n",
@@ -410,32 +464,33 @@ mod tests {
 
         fs::create_dir_all(home.join(".config"))?;
         fs::write(home.join(".config/foo.toml"), "a = 1\n")?;
+        init_git_repo_starship_style(&home)?;
         create_command("git")?
-            .args(["-C", home.to_str().unwrap(), "init"])
+            .args(["add", ".config/foo.toml"])
+            .current_dir(&home)
             .output()?;
-        create_command("git")?
-            .args(["-C", home.to_str().unwrap(), "add", ".config/foo.toml"])
+        let commit = create_command("git")?
+            .args(["commit", "-m", "init", "--no-gpg-sign"])
+            .current_dir(&home)
             .output()?;
-        create_command("git")?
-            .args([
-                "-C",
-                home.to_str().unwrap(),
-                "commit",
-                "-m",
-                "init",
-                "--no-gpg-sign",
-            ])
-            .output()?;
+        assert!(
+            commit.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
 
         let _ = fs::remove_dir_all(&repo_git);
-        create_command("git")?
-            .args([
-                "clone",
-                "--bare",
-                home.to_str().unwrap(),
-                repo_git.to_str().unwrap(),
-            ])
+        let home_name = home.file_name().unwrap().to_str().unwrap();
+        let repo_name = repo_git.file_name().unwrap().to_str().unwrap();
+        let clone_bare = create_command("git")?
+            .args(["clone", "--bare", home_name, repo_name])
+            .current_dir(tmp.path())
             .output()?;
+        assert!(
+            clone_bare.status.success(),
+            "git clone --bare failed: {}",
+            String::from_utf8_lossy(&clone_bare.stderr)
+        );
 
         let mut env = Env::default();
         env.insert("HOME", home.to_string_lossy().into_owned());
@@ -455,68 +510,150 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let server_git = tmp.path().join("server.git");
         fs::create_dir_all(server_git.join("objects"))?;
-        create_command("git")?
-            .args(["init", "--bare"])
+        let bare_init = create_command("git")?
+            .args(["init", "--bare", "-b", "master"])
             .arg(&server_git)
             .output()?;
+        if !bare_init.status.success() {
+            let out = create_command("git")?
+                .args(["init", "--bare"])
+                .arg(&server_git)
+                .output()?;
+            assert!(
+                out.status.success(),
+                "git init --bare failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
 
         let home = tmp.path().join("home");
         fs::create_dir_all(&home)?;
         fs::write(home.join("tracked.txt"), "v1\n")?;
+        init_git_repo_starship_style(&home)?;
         create_command("git")?
-            .args(["-C", home.to_str().unwrap(), "init"])
+            .args(["add", "tracked.txt"])
+            .current_dir(&home)
             .output()?;
+        let commit = create_command("git")?
+            .args(["commit", "-m", "init", "--no-gpg-sign"])
+            .current_dir(&home)
+            .output()?;
+        assert!(
+            commit.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
         create_command("git")?
-            .args(["-C", home.to_str().unwrap(), "add", "tracked.txt"])
+            .args(["remote", "add", "origin", server_git.to_str().unwrap()])
+            .current_dir(&home)
             .output()?;
-        create_command("git")?
-            .args([
-                "-C",
-                home.to_str().unwrap(),
-                "commit",
-                "-m",
-                "init",
-                "--no-gpg-sign",
-            ])
+        let push = create_command("git")?
+            .args(["push", "-u", "origin", "HEAD:master"])
+            .current_dir(&home)
             .output()?;
-        create_command("git")?
-            .args([
-                "-C",
-                home.to_str().unwrap(),
-                "remote",
-                "add",
-                "origin",
-                server_git.to_str().unwrap(),
-            ])
-            .output()?;
-        create_command("git")?
-            .args([
-                "-C",
-                home.to_str().unwrap(),
-                "push",
-                "-u",
-                "origin",
-                "HEAD:main",
-            ])
-            .output()?;
+        assert!(
+            push.status.success(),
+            "git push failed: {}",
+            String::from_utf8_lossy(&push.stderr)
+        );
 
+        // Mirror the remote bare repo (not `clone --bare` from `home`): a bare clone of a normal
+        // repo drops remote-tracking refs, so `for-each-ref` never sees an upstream until we
+        // re-fetch with a refspec. Mirroring `server.git` matches real YADM bare layouts.
         let repo_git = tmp.path().join("yadm.git");
         let _ = fs::remove_dir_all(&repo_git);
-        create_command("git")?
+        let server_name = server_git.file_name().unwrap().to_str().unwrap();
+        let yadm_repo_name = repo_git.file_name().unwrap().to_str().unwrap();
+        let mirror = create_command("git")?
+            .args(["clone", "--mirror", server_name, yadm_repo_name])
+            .current_dir(tmp.path())
+            .output()?;
+        assert!(
+            mirror.status.success(),
+            "git clone --mirror failed: {}",
+            String::from_utf8_lossy(&mirror.stderr)
+        );
+
+        let home_s = home.to_str().unwrap();
+        let repo_s = repo_git.to_str().unwrap();
+
+        let fetch_refspec = create_command("git")?
             .args([
-                "clone",
-                "--bare",
-                home.to_str().unwrap(),
-                repo_git.to_str().unwrap(),
+                "--git-dir",
+                repo_s,
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
             ])
             .output()?;
+        assert!(
+            fetch_refspec.status.success(),
+            "git config fetch refspec failed: {}",
+            String::from_utf8_lossy(&fetch_refspec.stderr)
+        );
 
-        create_command("git")?
+        let fetch = create_command("git")?
+            .args(["--git-dir", repo_s, "fetch", "origin"])
+            .output()?;
+        assert!(
+            fetch.status.success(),
+            "git fetch failed: {}",
+            String::from_utf8_lossy(&fetch.stderr)
+        );
+
+        for (key, val) in [
+            ("branch.master.remote", "origin"),
+            ("branch.master.merge", "refs/heads/master"),
+        ] {
+            let cfg = create_command("git")?
+                .args(["--git-dir", repo_s, "config", key, val])
+                .output()?;
+            assert!(
+                cfg.status.success(),
+                "git config {key} failed: {}",
+                String::from_utf8_lossy(&cfg.stderr)
+            );
+        }
+
+        for (key, val) in [
+            ("user.email", "starship@example.com"),
+            ("user.name", "starship"),
+        ] {
+            let id = create_command("git")?
+                .args(["--git-dir", repo_s, "config", key, val])
+                .output()?;
+            assert!(
+                id.status.success(),
+                "git config {key} on bare repo failed: {}",
+                String::from_utf8_lossy(&id.stderr)
+            );
+        }
+
+        // Drop the disposable worktree repo so only the YADM-style bare + `$HOME` layout remains.
+        fs::remove_dir_all(home.join(".git"))?;
+        let checkout = create_command("git")?
             .args([
-                "-C",
-                home.to_str().unwrap(),
+                "--work-tree",
+                home_s,
                 "--git-dir",
-                repo_git.to_str().unwrap(),
+                repo_s,
+                "checkout",
+                "-f",
+                "master",
+            ])
+            .output()?;
+        assert!(
+            checkout.status.success(),
+            "git checkout failed: {}",
+            String::from_utf8_lossy(&checkout.stderr)
+        );
+
+        let ahead_commit = create_command("git")?
+            .args([
+                "--work-tree",
+                home_s,
+                "--git-dir",
+                repo_s,
                 "commit",
                 "--allow-empty",
                 "-m",
@@ -524,6 +661,11 @@ mod tests {
                 "--no-gpg-sign",
             ])
             .output()?;
+        assert!(
+            ahead_commit.status.success(),
+            "git commit (ahead) failed: {}",
+            String::from_utf8_lossy(&ahead_commit.stderr)
+        );
 
         let mut env = Env::default();
         env.insert("HOME", home.to_string_lossy().into_owned());
