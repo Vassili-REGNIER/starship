@@ -172,8 +172,11 @@ fn upstream_ahead_count_via_git(
     command_timeout_ms: u64,
 ) -> Option<usize> {
     let mut cmd = create_command("git").ok()?;
+    // YADM uses a bare repo with `$HOME` as the work tree, which typically has no `.git`
+    // directory. `git -C "$HOME" --git-dir=...` then fails with "must be run in a work tree";
+    // use explicit `--work-tree` / `--git-dir` instead.
     cmd.env("GIT_OPTIONAL_LOCKS", "0")
-        .arg("-C")
+        .arg("--work-tree")
         .arg(worktree)
         .arg("--git-dir")
         .arg(repo_path)
@@ -195,7 +198,7 @@ fn is_yadm_dirty_or_ahead_via_git_executable(
 ) -> Option<bool> {
     let mut cmd = create_command("git").ok()?;
     cmd.env("GIT_OPTIONAL_LOCKS", "0")
-        .arg("-C")
+        .arg("--work-tree")
         .arg(worktree)
         .arg("--git-dir")
         .arg(repo_path)
@@ -309,7 +312,10 @@ fn is_yadm_dirty_or_ahead(context: &Context, repo_path: &Path, worktree: &Path) 
     let gix_repo = ts_repo.to_thread_local();
     let timeout_ms = context.root_config.command_timeout;
 
-    if gix_repo
+    // Typical YADM layout uses a bare repo with `$HOME` as the work tree and no `$HOME/.git`.
+    // In that case gix index/worktree status can miss modified tracked files; `git status`
+    // with explicit `--work-tree` / `--git-dir` matches Git (see subprocess helpers above).
+    let use_git_executable = gix_repo
         .index_or_empty()
         .ok()
         .is_some_and(|idx| idx.is_sparse())
@@ -318,7 +324,9 @@ fn is_yadm_dirty_or_ahead(context: &Context, repo_path: &Path, worktree: &Path) 
             .config_snapshot()
             .boolean("core.fsmonitor")
             .unwrap_or(false)
-    {
+        || !worktree.join(".git").exists();
+
+    if use_git_executable {
         return is_yadm_dirty_or_ahead_via_git_executable(repo_path, worktree, timeout_ms)
             .unwrap_or(false);
     }
@@ -328,7 +336,7 @@ fn is_yadm_dirty_or_ahead(context: &Context, repo_path: &Path, worktree: &Path) 
 
 #[cfg(test)]
 mod tests {
-    use super::{is_yadm_dirty_or_ahead, resolve_repo_path};
+    use super::{is_yadm_dirty_or_ahead, module, resolve_repo_path};
     use crate::config::ModuleConfig;
     use crate::configs::yadm::YadmConfig;
     use crate::context::{Context, Env, Properties, Shell, Target};
@@ -400,6 +408,416 @@ mod tests {
             PathBuf::from("/"),
             env,
         )
+    }
+
+    fn write_plausible_bare_git_layout(git_dir: &Path) -> io::Result<()> {
+        fs::create_dir_all(git_dir.join("objects"))?;
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/master\n")?;
+        fs::write(
+            git_dir.join("config"),
+            "[core]\n\tbare = true\nrepositoryformatversion = 0\n",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn module_returns_none_when_disabled() -> io::Result<()> {
+        let mut yadm_table = toml::Table::new();
+        yadm_table.insert("disabled".into(), toml::Value::Boolean(true));
+        let mut root = toml::Table::new();
+        root.insert("yadm".into(), toml::Value::Table(yadm_table));
+
+        let ctx = context_with_env(Env::default()).set_config(root);
+        assert!(
+            module(&ctx).is_none(),
+            "module should be None when disabled"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn is_yadm_dirty_or_ahead_uses_git_executable_when_fsmonitor_enabled_in_bare_config()
+    -> io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home)?;
+        let repo_git = tmp.path().join("repo.git");
+
+        fs::create_dir_all(home.join(".config"))?;
+        fs::write(home.join(".config/foo.toml"), "a = 1\n")?;
+        init_git_repo_starship_style(&home)?;
+        let add = create_command("git")?
+            .args(["add", ".config/foo.toml"])
+            .current_dir(&home)
+            .output()?;
+        assert!(
+            add.status.success(),
+            "git add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        let commit = create_command("git")?
+            .args(["commit", "-m", "init", "--no-gpg-sign"])
+            .current_dir(&home)
+            .output()?;
+        assert!(
+            commit.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+
+        let _ = fs::remove_dir_all(&repo_git);
+        let home_name = home.file_name().unwrap().to_str().unwrap();
+        let repo_name = repo_git.file_name().unwrap().to_str().unwrap();
+        let clone_bare = create_command("git")?
+            .args(["clone", "--bare", home_name, repo_name])
+            .current_dir(tmp.path())
+            .output()?;
+        assert!(
+            clone_bare.status.success(),
+            "git clone --bare failed: {}",
+            String::from_utf8_lossy(&clone_bare.stderr)
+        );
+
+        fs::remove_dir_all(home.join(".git"))?;
+        let checkout = create_command("git")?
+            .args([
+                "--work-tree",
+                home.to_str().unwrap(),
+                "--git-dir",
+                repo_git.to_str().unwrap(),
+                "checkout",
+                "-f",
+                "master",
+            ])
+            .output()?;
+        assert!(
+            checkout.status.success(),
+            "git checkout failed: {}",
+            String::from_utf8_lossy(&checkout.stderr)
+        );
+
+        let cfg_fs = create_command("git")?
+            .args([
+                "--git-dir",
+                repo_git.to_str().unwrap(),
+                "config",
+                "core.fsmonitor",
+                "true",
+            ])
+            .output()?;
+        assert!(
+            cfg_fs.status.success(),
+            "git config core.fsmonitor failed: {}",
+            String::from_utf8_lossy(&cfg_fs.stderr)
+        );
+
+        let mut env = Env::default();
+        env.insert("HOME", home.to_string_lossy().into_owned());
+        let ctx = context_with_env(env);
+
+        fs::write(home.join(".config/foo.toml"), "a = 2\n")?;
+        assert!(
+            is_yadm_dirty_or_ahead(&ctx, &repo_git, &home),
+            "dirty tree should be detected via git executable fallback when core.fsmonitor is true"
+        );
+
+        tmp.close()
+    }
+
+    #[test]
+    fn resolve_returns_none_when_no_default_yadm_repo() -> io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut env = Env::default();
+        env.insert("HOME", tmp.path().to_string_lossy().into_owned());
+        let ctx = context_with_env(env);
+        let config = YadmConfig::try_load(ctx.config.get_module_config("yadm"));
+        assert!(resolve_repo_path(&ctx, &config).is_none());
+        tmp.close()
+    }
+
+    #[test]
+    fn resolve_prefers_xdg_default_path_over_legacy_dot_yadm() -> io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home)?;
+        let xdg = home.join(".local/share/yadm/repo.git");
+        let legacy = home.join(".yadm/repo.git");
+        write_plausible_bare_git_layout(&xdg)?;
+        write_plausible_bare_git_layout(&legacy)?;
+
+        let mut env = Env::default();
+        env.insert("HOME", home.to_string_lossy().into_owned());
+        let ctx = context_with_env(env);
+        let config = YadmConfig::try_load(ctx.config.get_module_config("yadm"));
+        let resolved = resolve_repo_path(&ctx, &config).expect("repo path");
+        assert_eq!(
+            resolved, xdg,
+            "XDG-style default path should win over ~/.yadm/repo.git"
+        );
+        tmp.close()
+    }
+
+    #[test]
+    fn resolve_uses_xdg_data_home_for_default_path() -> io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home)?;
+        let custom = tmp.path().join("custom-data");
+        let repo = custom.join("yadm/repo.git");
+        write_plausible_bare_git_layout(&repo)?;
+
+        let mut env = Env::default();
+        env.insert("HOME", home.to_string_lossy().into_owned());
+        env.insert("XDG_DATA_HOME", custom.to_string_lossy().into_owned());
+        let ctx = context_with_env(env);
+        let config = YadmConfig::try_load(ctx.config.get_module_config("yadm"));
+        let resolved = resolve_repo_path(&ctx, &config).expect("repo path");
+        assert_eq!(resolved, repo);
+        tmp.close()
+    }
+
+    #[test]
+    fn module_returns_none_when_repo_is_clean() -> io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home)?;
+        let repo_git = tmp.path().join("repo.git");
+
+        fs::create_dir_all(home.join(".config"))?;
+        fs::write(home.join(".config/foo.toml"), "clean\n")?;
+        init_git_repo_starship_style(&home)?;
+        create_command("git")?
+            .args(["add", ".config/foo.toml"])
+            .current_dir(&home)
+            .output()?;
+        let commit = create_command("git")?
+            .args(["commit", "-m", "init", "--no-gpg-sign"])
+            .current_dir(&home)
+            .output()?;
+        assert!(commit.status.success());
+
+        let _ = fs::remove_dir_all(&repo_git);
+        let home_name = home.file_name().unwrap().to_str().unwrap();
+        let repo_name = repo_git.file_name().unwrap().to_str().unwrap();
+        let clone_bare = create_command("git")?
+            .args(["clone", "--bare", home_name, repo_name])
+            .current_dir(tmp.path())
+            .output()?;
+        assert!(clone_bare.status.success());
+
+        fs::remove_dir_all(home.join(".git"))?;
+        let checkout = create_command("git")?
+            .args([
+                "--work-tree",
+                home.to_str().unwrap(),
+                "--git-dir",
+                repo_git.to_str().unwrap(),
+                "checkout",
+                "-f",
+                "master",
+            ])
+            .output()?;
+        assert!(
+            checkout.status.success(),
+            "git checkout failed: {}",
+            String::from_utf8_lossy(&checkout.stderr)
+        );
+
+        let mut yadm_table = toml::Table::new();
+        yadm_table.insert(
+            "repo_path".into(),
+            toml::Value::String(repo_git.to_string_lossy().into_owned()),
+        );
+        let mut root = toml::Table::new();
+        root.insert("yadm".into(), toml::Value::Table(yadm_table));
+
+        let mut env = Env::default();
+        env.insert("HOME", home.to_string_lossy().into_owned());
+        let ctx = context_with_env(env).set_config(root);
+
+        assert!(
+            module(&ctx).is_none(),
+            "module should be hidden when there are no local changes and no ahead commits"
+        );
+        tmp.close()
+    }
+
+    #[test]
+    fn module_returns_some_when_repo_is_dirty() -> io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home)?;
+        let repo_git = tmp.path().join("repo.git");
+
+        fs::create_dir_all(home.join(".config"))?;
+        fs::write(home.join(".config/foo.toml"), "a = 1\n")?;
+        init_git_repo_starship_style(&home)?;
+        create_command("git")?
+            .args(["add", ".config/foo.toml"])
+            .current_dir(&home)
+            .output()?;
+        let commit = create_command("git")?
+            .args(["commit", "-m", "init", "--no-gpg-sign"])
+            .current_dir(&home)
+            .output()?;
+        assert!(commit.status.success());
+
+        let _ = fs::remove_dir_all(&repo_git);
+        let home_name = home.file_name().unwrap().to_str().unwrap();
+        let repo_name = repo_git.file_name().unwrap().to_str().unwrap();
+        let clone_bare = create_command("git")?
+            .args(["clone", "--bare", home_name, repo_name])
+            .current_dir(tmp.path())
+            .output()?;
+        assert!(clone_bare.status.success());
+
+        fs::remove_dir_all(home.join(".git"))?;
+        assert!(
+            create_command("git")?
+                .args([
+                    "--work-tree",
+                    home.to_str().unwrap(),
+                    "--git-dir",
+                    repo_git.to_str().unwrap(),
+                    "checkout",
+                    "-f",
+                    "master",
+                ])
+                .output()?
+                .status
+                .success()
+        );
+
+        let mut yadm_table = toml::Table::new();
+        yadm_table.insert(
+            "repo_path".into(),
+            toml::Value::String(repo_git.to_string_lossy().into_owned()),
+        );
+        let mut root = toml::Table::new();
+        root.insert("yadm".into(), toml::Value::Table(yadm_table));
+
+        let mut env = Env::default();
+        env.insert("HOME", home.to_string_lossy().into_owned());
+        let ctx = context_with_env(env).set_config(root);
+
+        fs::write(home.join(".config/foo.toml"), "a = 2\n")?;
+        assert!(
+            module(&ctx).is_some(),
+            "module should render when the YADM repo has working tree changes"
+        );
+        tmp.close()
+    }
+
+    #[test]
+    fn module_returns_none_on_invalid_format_string() -> io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home)?;
+        let repo_git = tmp.path().join("repo.git");
+
+        fs::create_dir_all(home.join(".config"))?;
+        fs::write(home.join(".config/foo.toml"), "a = 1\n")?;
+        init_git_repo_starship_style(&home)?;
+        create_command("git")?
+            .args(["add", ".config/foo.toml"])
+            .current_dir(&home)
+            .output()?;
+        assert!(
+            create_command("git")?
+                .args(["commit", "-m", "init", "--no-gpg-sign"])
+                .current_dir(&home)
+                .output()?
+                .status
+                .success()
+        );
+
+        let _ = fs::remove_dir_all(&repo_git);
+        let clone_bare = create_command("git")?
+            .args([
+                "clone",
+                "--bare",
+                home.file_name().unwrap().to_str().unwrap(),
+                repo_git.file_name().unwrap().to_str().unwrap(),
+            ])
+            .current_dir(tmp.path())
+            .output()?;
+        assert!(clone_bare.status.success());
+
+        fs::remove_dir_all(home.join(".git"))?;
+        assert!(
+            create_command("git")?
+                .args([
+                    "--work-tree",
+                    home.to_str().unwrap(),
+                    "--git-dir",
+                    repo_git.to_str().unwrap(),
+                    "checkout",
+                    "-f",
+                    "master",
+                ])
+                .output()?
+                .status
+                .success()
+        );
+
+        let mut yadm_table = toml::Table::new();
+        yadm_table.insert(
+            "repo_path".into(),
+            toml::Value::String(repo_git.to_string_lossy().into_owned()),
+        );
+        yadm_table.insert(
+            "format".into(),
+            toml::Value::String("[$symbol]($style".into()),
+        );
+        let mut root = toml::Table::new();
+        root.insert("yadm".into(), toml::Value::Table(yadm_table));
+
+        let mut env = Env::default();
+        env.insert("HOME", home.to_string_lossy().into_owned());
+        let ctx = context_with_env(env).set_config(root);
+
+        fs::write(home.join(".config/foo.toml"), "a = 2\n")?;
+        assert!(
+            module(&ctx).is_none(),
+            "invalid format should yield None after formatter error"
+        );
+        tmp.close()
+    }
+
+    #[test]
+    fn parse_porcelain_v2_branch_ab_ahead_extracts_count() {
+        assert_eq!(
+            super::parse_porcelain_v2_branch_ab_ahead("# branch.ab +5 -0"),
+            Some(5)
+        );
+        assert_eq!(
+            super::parse_porcelain_v2_branch_ab_ahead("# branch.ab +0 -3"),
+            Some(0)
+        );
+        assert_eq!(
+            super::parse_porcelain_v2_branch_ab_ahead("# branch.head master"),
+            None
+        );
+    }
+
+    #[test]
+    fn upstream_ahead_from_for_each_ref_line_parses_track() {
+        assert_eq!(super::upstream_ahead_from_for_each_ref_line(""), 0);
+        assert_eq!(super::upstream_ahead_from_for_each_ref_line(" "), 0);
+        assert_eq!(
+            super::upstream_ahead_from_for_each_ref_line("refs/remotes/origin/master [ahead 2]"),
+            2
+        );
+        assert_eq!(
+            super::upstream_ahead_from_for_each_ref_line(
+                "refs/remotes/origin/master [ahead 1, behind 3]"
+            ),
+            1
+        );
+        assert_eq!(
+            super::upstream_ahead_from_for_each_ref_line("refs/heads/main  [gone]"),
+            0
+        );
     }
 
     #[test]
