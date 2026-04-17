@@ -5079,15 +5079,17 @@ The module uses `$HOME` as the worktree and resolves the bare repository path in
 
 For the default paths (3–4), Starship only treats the directory as a candidate when it looks like a Git directory (`HEAD` and `config` are present). The module is hidden when the repository is clean and not ahead of upstream, or when disabled.
 
+The module runs `git status` against the resolved bare repository (with `--work-tree` set to `$HOME`), so Git must be installed and available on `PATH`. The global parameter `command_timeout` limits how long that command may run.
+
 ### Options
 
-| Option      | Default               | Description                                                                |
-| ----------- | --------------------- | -------------------------------------------------------------------------- |
-| `format`    | `'[$symbol]($style)'` | The format for the module.                                                 |
-| `symbol`    | `' '`                | The symbol shown when the module is displayed.                             |
-| `style`     | `'red'`               | The style for the module.                                                  |
-| `repo_path` | `''`                  | Path to the YADM bare repository; when empty, env and default paths apply. |
-| `disabled`  | `false`               | Disables the `yadm` module.                                                |
+| Option      | Default               | Description                                                                               |
+| ----------- | --------------------- | ----------------------------------------------------------------------------------------- |
+| `format`    | `'[$symbol]($style)'` | The format for the module.                                                                |
+| `symbol`    | `' '`                | The symbol shown when the module is displayed.                                            |
+| `style`     | `'red'`               | The style for the module.                                                                 |
+| `repo_path` | `unset`               | Path to the YADM bare repository; when unset, `YADM_REPO` and the default paths are used. |
+| `disabled`  | `false`               | Disables the `yadm` module.                                                               |
 
 ### Variables
 

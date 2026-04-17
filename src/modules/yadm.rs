@@ -1,24 +1,14 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::LazyLock;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use gix::ThreadSafeRepository;
-use gix::bstr::ByteVec;
-use gix::status::Submodule;
-use regex::Regex;
-
-use super::git_status::uses_reftables;
 use super::{Context, Module, ModuleConfig};
 
 use crate::configs::yadm::YadmConfig;
 use crate::formatter::StringFormatter;
 use crate::utils::{create_command, exec_timeout};
-use crate::{num_configured_starship_threads, num_rayon_threads};
 
-/// Shows when the YADM bare repository has uncommitted changes on tracked files or unpushed commits
-/// (local branch ahead of its upstream).
+/// Shows when the YADM bare repository has uncommitted changes on tracked files
+/// or unpushed commits (local branch ahead of its upstream).
 pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
     let mut module = context.new_module("yadm");
     let config = YadmConfig::try_load(module.config);
@@ -58,10 +48,11 @@ pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
     Some(module)
 }
 
-/// Resolves the YADM bare repository path according to the following priority order:
-/// 1. `[yadm].repo_path` in Starship config
-/// 2. `$YADM_REPO`
-/// 3. `$XDG_DATA_HOME/yadm/repo.git` (defaulting `XDG_DATA_HOME` to `$HOME/.local/share`), then `$HOME/.yadm/repo.git`
+/// Resolves the YADM bare repository path with the following priority:
+/// 1. `[yadm].repo_path` from Starship config
+/// 2. `$YADM_REPO` environment variable
+/// 3. `$XDG_DATA_HOME/yadm/repo.git` (falling back to `$HOME/.local/share`),
+///    then `$HOME/.yadm/repo.git`
 fn resolve_repo_path(context: &Context, config: &YadmConfig<'_>) -> Option<PathBuf> {
     if let Some(p) = config.repo_path.map(str::trim).filter(|s| !s.is_empty()) {
         return Some(Context::expand_tilde(PathBuf::from(p)));
@@ -93,110 +84,17 @@ fn is_plausible_yadm_git_dir(path: &Path) -> bool {
     path.join("HEAD").is_file() && path.join("config").is_file()
 }
 
-/// Match [`Context::get_repo`] permission defaults so YADM reads the same config sources as other Git modules.
-fn yadm_repository_open_options(worktree: &Path) -> gix::open::Options {
-    use gix::open::{Options, Permissions, permissions::Config as GitOpenConfig};
+/// Checks whether the YADM repository has any local changes on tracked files
+/// or unpushed commits by shelling out to `git status --porcelain=2 --branch`.
+///
+/// YADM typically uses a bare repository with `$HOME` as the work tree, so the
+/// `--work-tree` and `--git-dir` flags are provided explicitly.
+fn is_yadm_dirty_or_ahead(context: &Context, repo_path: &Path, worktree: &Path) -> bool {
+    let timeout = Duration::from_millis(context.root_config.command_timeout);
 
-    let config_perms = GitOpenConfig {
-        git_binary: true,
-        system: true,
-        git: true,
-        user: true,
-        env: true,
-        includes: true,
+    let Ok(mut cmd) = create_command("git") else {
+        return false;
     };
-    let permissions = Permissions {
-        config: config_perms,
-        ..Permissions::all()
-    };
-    let worktree_display = worktree.display().to_string();
-    Options::default()
-        .permissions(permissions)
-        .config_overrides([format!("core.worktree={worktree_display}")])
-}
-
-fn open_yadm_thread_safe_repository(
-    repo_path: &Path,
-    worktree: &Path,
-) -> Option<ThreadSafeRepository> {
-    ThreadSafeRepository::open_opts(repo_path, yadm_repository_open_options(worktree)).ok()
-}
-
-/// Parses `# branch.ab +AHEAD -BEHIND` from `git status --porcelain=v2 --branch` (see `git_status::RepoStatus::set_ahead_behind`).
-static BRANCH_AB_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"# branch\.ab \+([0-9]+) \-([0-9]+)").expect("valid regex"));
-
-fn parse_porcelain_v2_branch_ab_ahead(line: &str) -> Option<usize> {
-    BRANCH_AB_RE
-        .captures(line)
-        .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse().ok())
-}
-
-/// Parses `git for-each-ref --format='%(upstream) %(upstream:track)'` (mirrors `git_status::RepoStatus::set_ahead_behind_for_each_ref`).
-fn upstream_ahead_from_for_each_ref_line(line: &str) -> usize {
-    let line = line.trim();
-    if line.is_empty() || line == " " || line.ends_with(" [gone]") {
-        return 0;
-    }
-    let track = match line.split_once(' ') {
-        Some((_, rest)) => rest,
-        None => return 0,
-    };
-    let track = track.trim_matches(|c| c == '[' || c == ']');
-    let mut ahead = None;
-    let mut behind = None;
-    for pair in track.split(',') {
-        let mut tokens = pair.trim().splitn(2, ' ');
-        if let (Some(name), Some(number)) = (tokens.next(), tokens.next()) {
-            match name {
-                "ahead" => ahead = number.parse().ok(),
-                "behind" => behind = number.parse().ok(),
-                _ => {}
-            }
-        }
-    }
-    for field in [&mut ahead, &mut behind] {
-        if field.is_none() {
-            *field = Some(0);
-        }
-    }
-    ahead.unwrap_or(0)
-}
-
-/// Uses `git for-each-ref` with a subprocess timeout (same approach as the gix path in `git_status::get_repo_status`).
-fn upstream_ahead_count_via_git(
-    repo_path: &Path,
-    worktree: &Path,
-    branch_full_name: &str,
-    command_timeout_ms: u64,
-) -> Option<usize> {
-    let mut cmd = create_command("git").ok()?;
-    // YADM uses a bare repo with `$HOME` as the work tree, which typically has no `.git`
-    // directory. `git -C "$HOME" --git-dir=...` then fails with "must be run in a work tree";
-    // use explicit `--work-tree` / `--git-dir` instead.
-    cmd.env("GIT_OPTIONAL_LOCKS", "0")
-        .arg("--work-tree")
-        .arg(worktree)
-        .arg("--git-dir")
-        .arg(repo_path)
-        .args([
-            "for-each-ref",
-            "--format=%(upstream) %(upstream:track)",
-            branch_full_name,
-        ]);
-    let out = exec_timeout(&mut cmd, Duration::from_millis(command_timeout_ms))?;
-    let line = out.stdout.lines().next().unwrap_or_default();
-    Some(upstream_ahead_from_for_each_ref_line(line))
-}
-
-/// Fallback aligned with `git_status::get_repo_status` when using the Git executable: porcelain v2 plus `--branch`.
-fn is_yadm_dirty_or_ahead_via_git_executable(
-    repo_path: &Path,
-    worktree: &Path,
-    command_timeout_ms: u64,
-) -> Option<bool> {
-    let mut cmd = create_command("git").ok()?;
     cmd.env("GIT_OPTIONAL_LOCKS", "0")
         .arg("--work-tree")
         .arg(worktree)
@@ -211,127 +109,35 @@ fn is_yadm_dirty_or_ahead_via_git_executable(
             "--untracked-files=no",
             "--ignore-submodules=dirty",
         ]);
-    let out = exec_timeout(&mut cmd, Duration::from_millis(command_timeout_ms))?;
-    let mut dirty = false;
-    let mut ahead = false;
-    for line in out.stdout.lines() {
-        if line.starts_with("# branch.ab ") {
-            if parse_porcelain_v2_branch_ab_ahead(line).is_some_and(|n| n > 0) {
-                ahead = true;
-            }
-        } else if !line.is_empty() && !line.starts_with('#') {
-            dirty = true;
-        }
-    }
-    Some(dirty || ahead)
-}
 
-/// Native status via gix; upstream ahead count via `git for-each-ref` (same split as `git_status::get_repo_status`).
-fn is_yadm_dirty_or_ahead_via_gix(
-    gix_repo: &gix::Repository,
-    repo_path: &Path,
-    worktree: &Path,
-    command_timeout_ms: u64,
-) -> Option<bool> {
-    let is_interrupted = Arc::new(AtomicBool::new(false));
-    std::thread::Builder::new()
-        .name("starship yadm timer".into())
-        .stack_size(256 * 1024)
-        .spawn({
-            let is_interrupted = is_interrupted.clone();
-            let abort_after = Duration::from_millis(command_timeout_ms);
-            move || {
-                std::thread::sleep(abort_after);
-                is_interrupted.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        })
-        .expect("should be able to spawn timer thread");
-
-    let check_dirty = true;
-    let status = gix_repo
-        .status(gix::features::progress::Discard)
-        .ok()?
-        .index_worktree_submodules(Submodule::Given {
-            ignore: gix::submodule::config::Ignore::Dirty,
-            check_dirty,
-        })
-        .index_worktree_options_mut(|opts| {
-            opts.thread_limit = if cfg!(target_os = "macos") {
-                Some(num_configured_starship_threads().unwrap_or(3))
-            } else {
-                Some(num_rayon_threads())
-            };
-            opts.dirwalk_options.take();
-        })
-        .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled)
-        .should_interrupt_owned(is_interrupted.clone());
-
-    let status = status.into_iter(None).ok()?;
-
-    let branch_full_name = gix_repo.head_name().ok().flatten().and_then(|ref_name| {
-        Vec::from(gix::bstr::BString::from(ref_name))
-            .into_string()
-            .ok()
-    });
-    let upstream_ahead = branch_full_name
-        .as_deref()
-        .and_then(|name| {
-            upstream_ahead_count_via_git(repo_path, worktree, name, command_timeout_ms)
-        })
-        .unwrap_or(0);
-
-    if is_interrupted.load(std::sync::atomic::Ordering::Relaxed) {
-        return None;
-    }
-
-    if upstream_ahead > 0 {
-        return Some(true);
-    }
-
-    for item in status {
-        if is_interrupted.load(std::sync::atomic::Ordering::Relaxed) {
-            return None;
-        }
-        if item.ok().is_some() {
-            return Some(true);
-        }
-    }
-
-    if is_interrupted.load(std::sync::atomic::Ordering::Relaxed) {
-        return None;
-    }
-
-    Some(false)
-}
-
-fn is_yadm_dirty_or_ahead(context: &Context, repo_path: &Path, worktree: &Path) -> bool {
-    let Some(ts_repo) = open_yadm_thread_safe_repository(repo_path, worktree) else {
-        log::debug!("yadm: failed to open repository at {}", repo_path.display());
+    let Some(output) = exec_timeout(&mut cmd, timeout) else {
+        log::debug!(
+            "yadm: `git status` timed out or failed for {}",
+            repo_path.display()
+        );
         return false;
     };
-    let gix_repo = ts_repo.to_thread_local();
-    let timeout_ms = context.root_config.command_timeout;
 
-    // Typical YADM layout uses a bare repo with `$HOME` as the work tree and no `$HOME/.git`.
-    // In that case gix index/worktree status can miss modified tracked files; `git status`
-    // with explicit `--work-tree` / `--git-dir` matches Git (see subprocess helpers above).
-    let use_git_executable = gix_repo
-        .index_or_empty()
-        .ok()
-        .is_some_and(|idx| idx.is_sparse())
-        || uses_reftables(&gix_repo)
-        || gix_repo
-            .config_snapshot()
-            .boolean("core.fsmonitor")
-            .unwrap_or(false)
-        || !worktree.join(".git").exists();
-
-    if use_git_executable {
-        return is_yadm_dirty_or_ahead_via_git_executable(repo_path, worktree, timeout_ms)
-            .unwrap_or(false);
+    for line in output.stdout.lines() {
+        if let Some(rest) = line.strip_prefix("# branch.ab ") {
+            if parse_ahead_count(rest).is_some_and(|n| n > 0) {
+                return true;
+            }
+        } else if !line.is_empty() && !line.starts_with('#') {
+            return true;
+        }
     }
+    false
+}
 
-    is_yadm_dirty_or_ahead_via_gix(&gix_repo, repo_path, worktree, timeout_ms).unwrap_or(false)
+/// Extracts the ahead counter from the `+AHEAD -BEHIND` tail of a porcelain v2
+/// `# branch.ab` line.
+fn parse_ahead_count(rest: &str) -> Option<usize> {
+    rest.split_whitespace()
+        .next()?
+        .strip_prefix('+')?
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]
@@ -345,7 +151,6 @@ mod tests {
     use std::io;
     use std::path::{Path, PathBuf};
 
-    /// Same identity and fsync defaults as `crate::test::fixture_repo` / `git_metrics` tests.
     fn configure_git_user_and_fsync(repo: &Path) -> io::Result<()> {
         let email = create_command("git")?
             .args(["config", "--local", "user.email", "starship@example.com"])
@@ -378,8 +183,6 @@ mod tests {
         Ok(())
     }
 
-    /// Matches `git_metrics::create_repo_with_commit`: `init --quiet`, Starship test user, then
-    /// `checkout -b master` (may fail if already on `master`).
     fn init_git_repo_starship_style(repo: &Path) -> io::Result<()> {
         let init = create_command("git")?
             .args(["init", "--quiet"])
@@ -436,95 +239,6 @@ mod tests {
     }
 
     #[test]
-    fn is_yadm_dirty_or_ahead_uses_git_executable_when_fsmonitor_enabled_in_bare_config()
-    -> io::Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let home = tmp.path().join("home");
-        fs::create_dir_all(&home)?;
-        let repo_git = tmp.path().join("repo.git");
-
-        fs::create_dir_all(home.join(".config"))?;
-        fs::write(home.join(".config/foo.toml"), "a = 1\n")?;
-        init_git_repo_starship_style(&home)?;
-        let add = create_command("git")?
-            .args(["add", ".config/foo.toml"])
-            .current_dir(&home)
-            .output()?;
-        assert!(
-            add.status.success(),
-            "git add failed: {}",
-            String::from_utf8_lossy(&add.stderr)
-        );
-        let commit = create_command("git")?
-            .args(["commit", "-m", "init", "--no-gpg-sign"])
-            .current_dir(&home)
-            .output()?;
-        assert!(
-            commit.status.success(),
-            "git commit failed: {}",
-            String::from_utf8_lossy(&commit.stderr)
-        );
-
-        let _ = fs::remove_dir_all(&repo_git);
-        let home_name = home.file_name().unwrap().to_str().unwrap();
-        let repo_name = repo_git.file_name().unwrap().to_str().unwrap();
-        let clone_bare = create_command("git")?
-            .args(["clone", "--bare", home_name, repo_name])
-            .current_dir(tmp.path())
-            .output()?;
-        assert!(
-            clone_bare.status.success(),
-            "git clone --bare failed: {}",
-            String::from_utf8_lossy(&clone_bare.stderr)
-        );
-
-        fs::remove_dir_all(home.join(".git"))?;
-        let checkout = create_command("git")?
-            .args([
-                "--work-tree",
-                home.to_str().unwrap(),
-                "--git-dir",
-                repo_git.to_str().unwrap(),
-                "checkout",
-                "-f",
-                "master",
-            ])
-            .output()?;
-        assert!(
-            checkout.status.success(),
-            "git checkout failed: {}",
-            String::from_utf8_lossy(&checkout.stderr)
-        );
-
-        let cfg_fs = create_command("git")?
-            .args([
-                "--git-dir",
-                repo_git.to_str().unwrap(),
-                "config",
-                "core.fsmonitor",
-                "true",
-            ])
-            .output()?;
-        assert!(
-            cfg_fs.status.success(),
-            "git config core.fsmonitor failed: {}",
-            String::from_utf8_lossy(&cfg_fs.stderr)
-        );
-
-        let mut env = Env::default();
-        env.insert("HOME", home.to_string_lossy().into_owned());
-        let ctx = context_with_env(env);
-
-        fs::write(home.join(".config/foo.toml"), "a = 2\n")?;
-        assert!(
-            is_yadm_dirty_or_ahead(&ctx, &repo_git, &home),
-            "dirty tree should be detected via git executable fallback when core.fsmonitor is true"
-        );
-
-        tmp.close()
-    }
-
-    #[test]
     fn resolve_returns_none_when_no_default_yadm_repo() -> io::Result<()> {
         let tmp = tempfile::tempdir()?;
         let mut env = Env::default();
@@ -574,6 +288,56 @@ mod tests {
         let resolved = resolve_repo_path(&ctx, &config).expect("repo path");
         assert_eq!(resolved, repo);
         tmp.close()
+    }
+
+    #[test]
+    fn resolve_prefers_config_repo_path() -> io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let marker = tmp.path().join("bare.git");
+        write_plausible_bare_git_layout(&marker)?;
+
+        let mut yadm_table = toml::Table::new();
+        yadm_table.insert(
+            "repo_path".into(),
+            toml::Value::String(marker.to_string_lossy().into_owned()),
+        );
+        let mut root = toml::Table::new();
+        root.insert("yadm".into(), toml::Value::Table(yadm_table));
+
+        let mut env = Env::default();
+        env.insert("HOME", tmp.path().to_string_lossy().into_owned());
+        env.insert("YADM_REPO", "/should/not/use".into());
+        let ctx = context_with_env(env).set_config(root);
+
+        let config = YadmConfig::try_load(ctx.config.get_module_config("yadm"));
+        let resolved = resolve_repo_path(&ctx, &config).expect("repo path");
+        assert_eq!(resolved, marker);
+
+        tmp.close()
+    }
+
+    #[test]
+    fn resolve_uses_yadm_repo_env_when_no_config_path() -> io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let marker = tmp.path().join("from-env.git");
+        write_plausible_bare_git_layout(&marker)?;
+
+        let mut env = Env::default();
+        env.insert("HOME", tmp.path().to_string_lossy().into_owned());
+        env.insert("YADM_REPO", marker.to_string_lossy().into_owned());
+        let ctx = context_with_env(env);
+        let config = YadmConfig::try_load(ctx.config.get_module_config("yadm"));
+        let resolved = resolve_repo_path(&ctx, &config).expect("repo path");
+        assert_eq!(resolved, marker);
+
+        tmp.close()
+    }
+
+    #[test]
+    fn parse_ahead_count_extracts_ahead_only() {
+        assert_eq!(super::parse_ahead_count("+5 -0"), Some(5));
+        assert_eq!(super::parse_ahead_count("+0 -3"), Some(0));
+        assert_eq!(super::parse_ahead_count("master"), None);
     }
 
     #[test]
@@ -785,95 +549,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_porcelain_v2_branch_ab_ahead_extracts_count() {
-        assert_eq!(
-            super::parse_porcelain_v2_branch_ab_ahead("# branch.ab +5 -0"),
-            Some(5)
-        );
-        assert_eq!(
-            super::parse_porcelain_v2_branch_ab_ahead("# branch.ab +0 -3"),
-            Some(0)
-        );
-        assert_eq!(
-            super::parse_porcelain_v2_branch_ab_ahead("# branch.head master"),
-            None
-        );
-    }
-
-    #[test]
-    fn upstream_ahead_from_for_each_ref_line_parses_track() {
-        assert_eq!(super::upstream_ahead_from_for_each_ref_line(""), 0);
-        assert_eq!(super::upstream_ahead_from_for_each_ref_line(" "), 0);
-        assert_eq!(
-            super::upstream_ahead_from_for_each_ref_line("refs/remotes/origin/master [ahead 2]"),
-            2
-        );
-        assert_eq!(
-            super::upstream_ahead_from_for_each_ref_line(
-                "refs/remotes/origin/master [ahead 1, behind 3]"
-            ),
-            1
-        );
-        assert_eq!(
-            super::upstream_ahead_from_for_each_ref_line("refs/heads/main  [gone]"),
-            0
-        );
-    }
-
-    #[test]
-    fn resolve_prefers_config_repo_path() -> io::Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let marker = tmp.path().join("bare.git");
-        fs::create_dir_all(marker.join("objects"))?;
-        fs::write(marker.join("HEAD"), "ref: refs/heads/master\n")?;
-        fs::write(
-            marker.join("config"),
-            "[core]\n\tbare = true\nrepositoryformatversion = 0\n",
-        )?;
-
-        let mut yadm_table = toml::Table::new();
-        yadm_table.insert(
-            "repo_path".into(),
-            toml::Value::String(marker.to_string_lossy().into_owned()),
-        );
-        let mut root = toml::Table::new();
-        root.insert("yadm".into(), toml::Value::Table(yadm_table));
-
-        let mut env = Env::default();
-        env.insert("HOME", tmp.path().to_string_lossy().into_owned());
-        env.insert("YADM_REPO", "/should/not/use".into());
-        let ctx = context_with_env(env).set_config(root);
-
-        let config = YadmConfig::try_load(ctx.config.get_module_config("yadm"));
-        let resolved = resolve_repo_path(&ctx, &config).expect("repo path");
-        assert_eq!(resolved, marker);
-
-        tmp.close()
-    }
-
-    #[test]
-    fn resolve_uses_yadm_repo_env_when_no_config_path() -> io::Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let marker = tmp.path().join("from-env.git");
-        fs::create_dir_all(marker.join("objects"))?;
-        fs::write(marker.join("HEAD"), "ref: refs/heads/master\n")?;
-        fs::write(
-            marker.join("config"),
-            "[core]\n\tbare = true\nrepositoryformatversion = 0\n",
-        )?;
-
-        let mut env = Env::default();
-        env.insert("HOME", tmp.path().to_string_lossy().into_owned());
-        env.insert("YADM_REPO", marker.to_string_lossy().into_owned());
-        let ctx = context_with_env(env);
-        let config = YadmConfig::try_load(ctx.config.get_module_config("yadm"));
-        let resolved = resolve_repo_path(&ctx, &config).expect("repo path");
-        assert_eq!(resolved, marker);
-
-        tmp.close()
-    }
-
-    #[test]
     fn is_yadm_dirty_or_ahead_detects_modified_tracked_file() -> io::Result<()> {
         let tmp = tempfile::tempdir()?;
         let home = tmp.path().join("home");
@@ -975,9 +650,9 @@ mod tests {
             String::from_utf8_lossy(&push.stderr)
         );
 
-        // Mirror the remote bare repo (not `clone --bare` from `home`): a bare clone of a normal
-        // repo drops remote-tracking refs, so `for-each-ref` never sees an upstream until we
-        // re-fetch with a refspec. Mirroring `server.git` matches real YADM bare layouts.
+        // Mirror the remote bare repo to match a real YADM layout: a plain
+        // `clone --bare` from a normal repo drops remote-tracking refs so the
+        // upstream tracking info is never recorded.
         let repo_git = tmp.path().join("yadm.git");
         let _ = fs::remove_dir_all(&repo_git);
         let server_name = server_git.file_name().unwrap().to_str().unwrap();
@@ -1047,7 +722,6 @@ mod tests {
             );
         }
 
-        // Drop the disposable worktree repo so only the YADM-style bare + `$HOME` layout remains.
         fs::remove_dir_all(home.join(".git"))?;
         let checkout = create_command("git")?
             .args([
