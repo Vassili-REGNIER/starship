@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use super::{Context, Module, ModuleConfig};
 
 use crate::configs::yadm::YadmConfig;
+use crate::context::Repo;
 use crate::formatter::StringFormatter;
-use crate::utils::{create_command, exec_timeout};
+use crate::modules::git_status;
 
 /// Shows when the YADM bare repository has uncommitted changes on tracked files
 /// or unpushed commits (local branch ahead of its upstream).
@@ -20,7 +20,25 @@ pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
     let home = context.get_home()?;
     let repo_path = resolve_repo_path(context, &config)?;
 
-    if !is_yadm_dirty_or_ahead(context, &repo_path, &home) {
+    // YADM uses a bare repository with `$HOME` as the work-tree, so it is not the
+    // repository discovered from `current_dir` by `context.get_repo()`. We build a
+    // standalone `Repo` for this explicit `git_dir` + `work_tree` pair so we can
+    // reuse `Repo::exec_git` (which already handles `--git-dir`, `--work-tree`,
+    // `GIT_OPTIONAL_LOCKS`, `core.fsmonitor`, and the configured timeout).
+    let repo = Repo::open_bare(repo_path, home)?;
+
+    let output = repo.exec_git(
+        context,
+        [
+            "status",
+            "--porcelain=2",
+            "--branch",
+            "--untracked-files=no",
+            "--ignore-submodules=dirty",
+        ],
+    )?;
+
+    if !git_status::is_dirty_or_ahead(&output.stdout) {
         return None;
     }
 
@@ -84,65 +102,9 @@ fn is_plausible_yadm_git_dir(path: &Path) -> bool {
     path.join("HEAD").is_file() && path.join("config").is_file()
 }
 
-/// Checks whether the YADM repository has any local changes on tracked files
-/// or unpushed commits by shelling out to `git status --porcelain=2 --branch`.
-///
-/// YADM typically uses a bare repository with `$HOME` as the work tree, so the
-/// `--work-tree` and `--git-dir` flags are provided explicitly.
-fn is_yadm_dirty_or_ahead(context: &Context, repo_path: &Path, worktree: &Path) -> bool {
-    let timeout = Duration::from_millis(context.root_config.command_timeout);
-
-    let Ok(mut cmd) = create_command("git") else {
-        return false;
-    };
-    cmd.env("GIT_OPTIONAL_LOCKS", "0")
-        .arg("--work-tree")
-        .arg(worktree)
-        .arg("--git-dir")
-        .arg(repo_path)
-        .arg("-c")
-        .arg("core.fsmonitor=")
-        .args([
-            "status",
-            "--porcelain=2",
-            "--branch",
-            "--untracked-files=no",
-            "--ignore-submodules=dirty",
-        ]);
-
-    let Some(output) = exec_timeout(&mut cmd, timeout) else {
-        log::debug!(
-            "yadm: `git status` timed out or failed for {}",
-            repo_path.display()
-        );
-        return false;
-    };
-
-    for line in output.stdout.lines() {
-        if let Some(rest) = line.strip_prefix("# branch.ab ") {
-            if parse_ahead_count(rest).is_some_and(|n| n > 0) {
-                return true;
-            }
-        } else if !line.is_empty() && !line.starts_with('#') {
-            return true;
-        }
-    }
-    false
-}
-
-/// Extracts the ahead counter from the `+AHEAD -BEHIND` tail of a porcelain v2
-/// `# branch.ab` line.
-fn parse_ahead_count(rest: &str) -> Option<usize> {
-    rest.split_whitespace()
-        .next()?
-        .strip_prefix('+')?
-        .parse()
-        .ok()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{is_yadm_dirty_or_ahead, module, resolve_repo_path};
+    use super::{module, resolve_repo_path};
     use crate::config::ModuleConfig;
     use crate::configs::yadm::YadmConfig;
     use crate::context::{Context, Env, Properties, Shell, Target};
@@ -331,13 +293,6 @@ mod tests {
         assert_eq!(resolved, marker);
 
         tmp.close()
-    }
-
-    #[test]
-    fn parse_ahead_count_extracts_ahead_only() {
-        assert_eq!(super::parse_ahead_count("+5 -0"), Some(5));
-        assert_eq!(super::parse_ahead_count("+0 -3"), Some(0));
-        assert_eq!(super::parse_ahead_count("master"), None);
     }
 
     #[test]
@@ -549,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn is_yadm_dirty_or_ahead_detects_modified_tracked_file() -> io::Result<()> {
+    fn module_detects_modified_tracked_file() -> io::Result<()> {
         let tmp = tempfile::tempdir()?;
         let home = tmp.path().join("home");
         fs::create_dir_all(&home)?;
@@ -585,13 +540,21 @@ mod tests {
             String::from_utf8_lossy(&clone_bare.stderr)
         );
 
+        let mut yadm_table = toml::Table::new();
+        yadm_table.insert(
+            "repo_path".into(),
+            toml::Value::String(repo_git.to_string_lossy().into_owned()),
+        );
+        let mut root = toml::Table::new();
+        root.insert("yadm".into(), toml::Value::Table(yadm_table));
+
         let mut env = Env::default();
         env.insert("HOME", home.to_string_lossy().into_owned());
-        let ctx = context_with_env(env);
+        let ctx = context_with_env(env).set_config(root);
 
         fs::write(home.join(".config/foo.toml"), "a = 2\n")?;
         assert!(
-            is_yadm_dirty_or_ahead(&ctx, &repo_git, &home),
+            module(&ctx).is_some(),
             "modified tracked file should be detected"
         );
 
@@ -599,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn is_yadm_dirty_or_ahead_detects_ahead_of_upstream() -> io::Result<()> {
+    fn module_detects_ahead_of_upstream() -> io::Result<()> {
         let tmp = tempfile::tempdir()?;
         let server_git = tmp.path().join("server.git");
         fs::create_dir_all(server_git.join("objects"))?;
@@ -759,12 +722,20 @@ mod tests {
             String::from_utf8_lossy(&ahead_commit.stderr)
         );
 
+        let mut yadm_table = toml::Table::new();
+        yadm_table.insert(
+            "repo_path".into(),
+            toml::Value::String(repo_git.to_string_lossy().into_owned()),
+        );
+        let mut root = toml::Table::new();
+        root.insert("yadm".into(), toml::Value::Table(yadm_table));
+
         let mut env = Env::default();
         env.insert("HOME", home.to_string_lossy().into_owned());
-        let ctx = context_with_env(env);
+        let ctx = context_with_env(env).set_config(root);
 
         assert!(
-            is_yadm_dirty_or_ahead(&ctx, &repo_git, &home),
+            module(&ctx).is_some(),
             "local branch ahead of upstream should be detected"
         );
 
